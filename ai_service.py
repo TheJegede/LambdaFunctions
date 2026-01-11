@@ -4,6 +4,72 @@ import logging
 import re  # <--- CRITICAL IMPORT
 from typing import Dict, Any
 from prompts import MASTER_PROMPT_TEMPLATE
+import logic
+
+# In ai_service.py
+
+# 1. ADD this new constant at the top with your other imports/constants
+EXTRACTION_SYS_PROMPT = """
+You are a precise data extraction engine for a supply chain negotiation bot.
+Your task is to analyze the User's latest message and extract specific negotiation terms.
+
+RULES:
+1. Extract the *latest valid offer* made by the user.
+2. Distinguish between a REJECTION and an OFFER.
+   - User: "I cannot do $50." -> Price: null (They are rejecting, not offering).
+   - User: "I cannot do $50, how about $45?" -> Price: 45.
+3. If the user mentions a range ("$40-$45"), extract the number most favorable to them (the lower price, 40).
+4. If a term is not mentioned or is just a reference to a previous turn, return null.
+5. Return ONLY a valid JSON object. No markdown, no conversational text.
+
+JSON FORMAT:
+{
+    "price": <number or null>,
+    "delivery": <number of days or null>,
+    "volume": <number of units or null>
+}
+"""
+
+# 2. ADD this new function to ai_service.py
+def extract_negotiation_terms(user_input: str) -> dict:
+    """
+    Uses Claude 3 Haiku to intelligently extract terms, fixing the 'Regex Trap'.
+    """
+    try:
+        bedrock = boto3.client('bedrock-runtime', region_name="us-east-2")
+        
+        # Combine instructions with the specific input
+        messages = [
+            {"role": "user", "content": f"{EXTRACTION_SYS_PROMPT}\n\nUser Message: \"{user_input}\""}
+        ]
+
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 100, # Keep it small for speed
+            "temperature": 0.0, # Deterministic for data extraction
+            "messages": messages
+        }
+
+        response = bedrock.invoke_model(
+            modelId="us.anthropic.claude-3-haiku-20240307-v1:0",
+            body=json.dumps(body),
+            contentType='application/json'
+        )
+
+        result = json.loads(response['body'].read())
+        response_text = result['content'][0]['text'].strip()
+        
+        # Parse the JSON response
+        # Sometimes models add ```json ... ``` wrappers, so we clean them
+        clean_json = re.sub(r'```json\s*|\s*```', '', response_text)
+        data = json.loads(clean_json)
+        
+        return data
+
+    except Exception as e:
+        logger.error(f"Extraction Error: {e}")
+        # Fallback to returning Nones so the code doesn't crash
+        return {"price": None, "delivery": None, "volume": None}
 
 logger = logging.getLogger(__name__)
 
@@ -51,30 +117,51 @@ def clean_ai_response(text):
 
 def generate_turn_guidance(user_input, history, deal_params_str):
     """
-    Calculates the EXACT move, including Missing Term Detection.
+    Calculates the EXACT move using Neuro-Symbolic extraction.
     """
-    # 1. Parse Baseline
+    # --- 1. NEW: Intelligent Extraction ---
+    # We call Haiku ONCE to get all terms accurately
+    extracted = extract_negotiation_terms(user_input)
+    
+    # We use these extracted values throughout the function.
+    # DO NOT call extract_price() or extract_delivery() again later.
+    user_price = extracted.get('price')
+    user_delivery = extracted.get('delivery')
+    user_volume = extracted.get('volume')
+
+    # --- 2. CRITICAL: Deal Detection Check ---
+    # We pass the smart extracted terms to logic.py
+    is_deal, terms = logic.detect_deal_readiness(history, current_extracted_terms=extracted)
+
+    # --- 3. THE LOOP BREAKER (This was missing!) ---
+    # If logic.py says it's a deal, we FORCE the AI to stop negotiating.
+    if is_deal:
+        return (f"DEAL DETECTED. The user has accepted. "
+                f"CONFIRM these exact terms: Price ${terms['price']}, "
+                f"Delivery {terms['delivery']} days. "
+                f"Do NOT ask any more questions. Say 'Deal confirmed' and list the terms.")
+
+    # --- 4. Standard Negotiation Logic (Runs only if NO deal) ---
+
+    # Parse Baseline
     standard_vol = 1000
     if deal_params_str and "Standard Order = 1000" in deal_params_str: 
         standard_vol = 1000
     
-    # 2. Get Last AI Terms
+    # Get Last AI Terms (Keep this existing logic to track AI's state)
     last_ai_price = None
-    last_ai_delivery = None
-    
-    # Safety check for history
     if not history: history = []
 
     for msg in reversed(history):
         if msg.get('role') == 'assistant':
             content = msg.get('content', '')
-            p = extract_price(content)
-            d = extract_delivery(content)
-            if p: last_ai_price = p
-            if d: last_ai_delivery = d
-            if p and d: break 
+            # It is okay to use regex on AI text because AI text is predictable
+            p = extract_price(content) 
+            if p: 
+                last_ai_price = p
+                break 
             
-    # Fallback
+    # Fallback for AI Price
     if not last_ai_price:
         if deal_params_str:
             match = re.search(r'Opening Price: \$([0-9.]+)', deal_params_str)
@@ -83,21 +170,22 @@ def generate_turn_guidance(user_input, history, deal_params_str):
         else:
             last_ai_price = 400.0
 
-    # 3. Analyze User Input
-    user_price = extract_price(user_input)
-    user_volume = extract_volume(user_input)
-    user_delivery = extract_delivery(user_input)
-    
-    # --- RULE A: AGREEMENT CHECK ---
+    # --- RULE A: AGREEMENT CHECK (Revised) ---
+    # If we are here, is_deal was False. So if the user said "agree", something is missing.
     agreement_words = ["deal", "agree", "accept", "done", "sounds good", "okay"]
     is_agreement = any(w in user_input.lower() for w in agreement_words)
     
     if is_agreement:
+        # We rely on the Haiku extraction we did at the top
         has_final_price = user_price or last_ai_price
-        has_final_delivery = user_delivery or last_ai_delivery
         
-        if not has_final_delivery:
-            return f"User agreed, but DELIVERY DATE is missing. Do NOT confirm. Say: 'We have a price, but we need to agree on delivery time.'"
+        # If Haiku didn't find delivery in this turn or history, we prompt for it.
+        if not user_delivery and not terms['delivery']: 
+             return f"User agreed, but DELIVERY DATE is missing. Do NOT confirm. Say: 'We have a price, but we need to agree on delivery time.'"
+        
+        # If we have price and delivery but is_deal was False, it might be a glitch,
+        # but usually it means the user text was ambiguous. 
+        # We default to asking for confirmation.
         if not has_final_price:
             return f"User agreed, but PRICE is unclear. Do NOT confirm. Ask to confirm price."
 
@@ -112,9 +200,7 @@ def generate_turn_guidance(user_input, history, deal_params_str):
     # --- RULE D: STALEMATE ---
     if len(history) >= 2 and history[-2].get('role') == 'user':
         last_user_input = history[-2].get('content', '')
-        last_user_price = extract_price(last_user_input)
-        
-        if (user_price and last_user_price and abs(user_price - last_user_price) < 0.1) or (user_input.strip().lower() == last_user_input.strip().lower()):
+        if user_input.strip().lower() == last_user_input.strip().lower():
              return f"User repeated their offer. You MUST hold firm at exactly ${last_ai_price}. Say: 'As I stated, I cannot accept that.'"
 
     # --- RULE E: CALCULATION LOGIC ---
