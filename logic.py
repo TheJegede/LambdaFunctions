@@ -43,37 +43,18 @@ def format_deal_parameters(params):
 5. Opening Delivery: {params['delivery']['opening']} days
 """
 
-# --- 3. HELPERS ---
-def extract_price(text):
-    if not text: return None
-    match = re.search(r'\$\s*([0-9][0-9,]*(?:\.\d+)?)', text)
-    if match:
-        try: return float(match.group(1).replace(',', ''))
-        except: return None
-    return None
-
-def extract_delivery(text):
-    if not text: return None
-    match = re.search(r'(\d+)\s*days?', text.lower())
-    if match: return int(match.group(1))
-    return None
-
-def extract_volume(text):
-    if not text: return None
-    txt = text.lower()
-    m_k = re.search(r'(\d+(?:\.\d+)?)\s*k\b', txt)
-    if m_k: return int(float(m_k.group(1)) * 1000)
-    m_u = re.search(r'(\d+(?:,\d{3})*)\s*units?', txt)
-    if m_u: return int(m_u.group(1).replace(',', ''))
-    return None
-
-# --- 4. STRICT DEAL DETECTION ---
-def detect_deal_readiness(history):
+# --- 3. STRICT DEAL DETECTION (Updated) ---
+def detect_deal_readiness(history, current_extracted_terms=None):
     """
-    Checks if the deal is ACTUALLY done.
-    REQUIREMENT: Must have a Signal AND (Price + Delivery).
+    Checks if the deal is ACTUALLY done using terms extracted by the AI.
+    
+    Args:
+        history: list of messages (conversation context)
+        current_extracted_terms: dict (optional) - The specific terms found in the CURRENT message 
+                                 by Claude Haiku in ai_service.py.
+                                 Format: {'price': 40, 'delivery': 30, 'volume': 1000}
     """
-    if len(history) < 3: return False, None
+    if len(history) < 2: return False, None
     
     last_msg = history[-1]
     content = last_msg['content'].lower()
@@ -86,31 +67,59 @@ def detect_deal_readiness(history):
         "let's do it", "lets do it", "i can do that", "that works",
         "done", "fine", "ok deal", "okay deal", "deal"
     ]
+    
     has_signal = any(phrase in content for phrase in strong_signals)
     
-    # Negation Check
+    # Negation Check (e.g. "I do NOT accept")
     negations = ["don't", "dont", "cannot", "can't", "won't", "not", "unable"]
     if has_signal:
         for neg in negations:
+            # Simple check: if a negation word is present, we are cautious.
+            # Exception: "Why not? Agreed." -> contains 'not' but is an agreement.
+            # This is a heuristic; the AI extraction is the primary source of truth, 
+            # but this signal check prevents false positives on simple chatter.
             if neg in content and ("confirmed" not in content and "agreed" not in content):
                 has_signal = False
     
-    # 2. Extract Terms from recent context
-    current_terms = {"price": None, "delivery": None, "volume": None}
+    # 2. Consolidate Terms
+    # We combine the terms found in the LATEST message (by Haiku) 
+    # with terms found in previous messages (to handle "I accept your price of $400")
     
-    # Scan last 3 messages to gather terms
-    for msg in reversed(history[-3:]):
-        txt = msg['content']
-        if current_terms["price"] is None: current_terms["price"] = extract_price(txt)
-        if current_terms["delivery"] is None: current_terms["delivery"] = extract_delivery(txt)
-        if current_terms["volume"] is None: current_terms["volume"] = extract_volume(txt)
+    final_terms = {"price": None, "delivery": None, "volume": None}
+
+    # If we have accurate AI extraction for the current turn, use it
+    if current_extracted_terms:
+        final_terms.update(current_extracted_terms)
+
+    # 3. Backfill missing terms from history (Context Window)
+    # If the user says "Deal", they are implicitly accepting the AI's last offer.
+    # We need to find what the AI last proposed to fill in the blanks.
+    if has_signal:
+        for msg in reversed(history):
+            # If we are still missing terms, check the AI's previous messages
+            if msg['role'] == 'assistant':
+                txt = msg['content']
+                
+                # FALLBACK REGEX (Only for AI text, which is predictable)
+                # We search AI text to see what offer is currently on the table
+                if final_terms['price'] is None: 
+                    m = re.search(r'\$\s*([0-9][0-9,]*(?:\.\d+)?)', txt)
+                    if m: final_terms['price'] = float(m.group(1).replace(',', ''))
+                
+                if final_terms['delivery'] is None:
+                    m = re.search(r'(\d+)\s*days?', txt.lower())
+                    if m: final_terms['delivery'] = int(m.group(1))
+                    
+                # If we have both now, stop searching back
+                if final_terms['price'] and final_terms['delivery']:
+                    break
     
-    # 3. THE FIX: Explicitly check for Price AND Delivery
-    has_price = current_terms["price"] is not None
-    has_delivery = current_terms["delivery"] is not None
+    # 4. Final Verification
+    has_price = final_terms["price"] is not None
+    has_delivery = final_terms["delivery"] is not None
     
     # Only return True if we have the Signal AND both critical terms
     if has_signal and has_price and has_delivery:
-        return True, current_terms
+        return True, final_terms
         
     return False, None
